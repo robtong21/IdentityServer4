@@ -12,18 +12,21 @@ using System.Security.Claims;
 using IdentityModel.Client;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Builder;
+using IdentityServer4.Validation;
 
 namespace IdentityServer4.Tests.Common
 {
-    public class MockAuthorizationPipeline : IdentityServerPipeline
+    public class MockIdSvrUiPipeline : IdentityServerPipeline
     {
         public RequestDelegate Login { get; set; }
+        public RequestDelegate Logout { get; set; }
         public RequestDelegate Consent { get; set; }
         public RequestDelegate Error { get; set; }
 
-        public MockAuthorizationPipeline()
+        public MockIdSvrUiPipeline()
         {
             Login = OnLogin;
+            Logout = OnLogout;
             Consent = OnConsent;
             Error = OnError;
 
@@ -40,7 +43,7 @@ namespace IdentityServer4.Tests.Common
         {
             if (CookieAuthenticationScheme != null)
             {
-                this.Options.AuthenticationOptions.PrimaryAuthenticationScheme = CookieAuthenticationScheme;
+                this.Options.AuthenticationOptions.AuthenticationScheme = CookieAuthenticationScheme;
                 app.UseCookieAuthentication(new CookieAuthenticationOptions {
                     AuthenticationScheme = CookieAuthenticationScheme
                 });
@@ -49,17 +52,22 @@ namespace IdentityServer4.Tests.Common
 
         private void MockAuthorizationPipeline_OnPostConfigure(IApplicationBuilder app)
         {
-            app.Map(Constants.RoutePaths.Login.EnsureLeadingSlash(), path =>
+            app.Map(Constants.UIConstants.DefaultRoutePaths.Login.EnsureLeadingSlash(), path =>
             {
                 path.Run(ctx => Login(ctx));
             });
 
-            app.Map(Constants.RoutePaths.Consent.EnsureLeadingSlash(), path =>
+            app.Map(Constants.UIConstants.DefaultRoutePaths.Logout.EnsureLeadingSlash(), path =>
+            {
+                path.Run(ctx => Logout(ctx));
+            });
+
+            app.Map(Constants.UIConstants.DefaultRoutePaths.Consent.EnsureLeadingSlash(), path =>
             {
                 path.Run(ctx => Consent(ctx));
             });
 
-            app.Map(Constants.RoutePaths.Error.EnsureLeadingSlash(), path =>
+            app.Map(Constants.UIConstants.DefaultRoutePaths.Error.EnsureLeadingSlash(), path =>
             {
                 path.Run(ctx => Error(ctx));
             });
@@ -68,29 +76,21 @@ namespace IdentityServer4.Tests.Common
         public string CookieAuthenticationScheme { get; set; } = "cookie_authn";
 
         public bool LoginWasCalled { get; set; }
-        public SignInRequest SignInRequest { get; set; }
+        public AuthorizationRequest LoginRequest { get; set; }
         public ClaimsPrincipal Subject { get; set; }
-        public SignInResponse SignInResponse { get; set; }
+        public bool FollowLoginReturnUrl { get; set; }
 
         async Task OnLogin(HttpContext ctx)
         {
             LoginWasCalled = true;
-            await ReadSignInMessage(ctx);
+            await ReadLoginRequest(ctx);
             await IssueLoginCookie(ctx);
-            await CreateSignInResponse(ctx);
         }
 
-        async Task ReadSignInMessage(HttpContext ctx)
+        async Task ReadLoginRequest(HttpContext ctx)
         {
-            try
-            {
-                var interaction = ctx.RequestServices.GetRequiredService<SignInInteraction>();
-                SignInRequest = await interaction.GetRequestAsync(ctx.Request.Query["id"].First());
-            }
-            catch(Exception ex) {
-                    var msg = ex.ToString();
-                //Trace.Write(msg);
-            }
+            var interaction = ctx.RequestServices.GetRequiredService<IUserInteractionService>();
+            LoginRequest = await interaction.GetLoginContextAsync();
         }
 
         async Task IssueLoginCookie(HttpContext ctx)
@@ -99,20 +99,31 @@ namespace IdentityServer4.Tests.Common
             {
                 await ctx.Authentication.SignInAsync(CookieAuthenticationScheme, Subject);
                 Subject = null;
+                var url = ctx.Request.Query[this.Options.UserInteractionOptions.LoginReturnUrlParameter].FirstOrDefault();
+                if (url != null)
+                {
+                    ctx.Response.Redirect(url);
+                }
             }
         }
 
-        async Task CreateSignInResponse(HttpContext ctx)
+        public bool LogoutWasCalled { get; set; }
+        public LogoutRequest LogoutRequest { get; set; }
+
+        async Task OnLogout(HttpContext ctx)
         {
-            if (SignInResponse != null)
-            {
-                var interaction = ctx.RequestServices.GetRequiredService<SignInInteraction>();
-                await interaction.ProcessResponseAsync(ctx.Request.Query["id"].First(), SignInResponse);
-            }
+            LogoutWasCalled = true;
+            await ReadLogoutRequest(ctx);
+        }
+
+        private async Task ReadLogoutRequest(HttpContext ctx)
+        {
+            var interaction = ctx.RequestServices.GetRequiredService<IUserInteractionService>();
+            LogoutRequest = await interaction.GetLogoutContextAsync();
         }
 
         public bool ConsentWasCalled { get; set; }
-        public ConsentRequest ConsentRequest { get; set; }
+        public AuthorizationRequest ConsentRequest { get; set; }
         public ConsentResponse ConsentResponse { get; set; }
 
         async Task OnConsent(HttpContext ctx)
@@ -124,21 +135,23 @@ namespace IdentityServer4.Tests.Common
 
         async Task ReadConsentMessage(HttpContext ctx)
         {
-            try
-            {
-                var interaction = ctx.RequestServices.GetRequiredService<ConsentInteraction>();
-                ConsentRequest = await interaction.GetRequestAsync(ctx.Request.Query["id"].First());
-            }
-            catch { }
+            var interaction = ctx.RequestServices.GetRequiredService<IUserInteractionService>();
+            ConsentRequest = await interaction.GetConsentContextAsync();
         }
 
         async Task CreateConsentResponse(HttpContext ctx)
         {
-            if (ConsentResponse != null)
+            if (ConsentRequest != null && ConsentResponse != null)
             {
-                var interaction = ctx.RequestServices.GetRequiredService<ConsentInteraction>();
-                await interaction.ProcessResponseAsync(ctx.Request.Query["id"].First(), ConsentResponse);
+                var interaction = ctx.RequestServices.GetRequiredService<IUserInteractionService>();
+                await interaction.GrantConsentAsync(ConsentRequest, ConsentResponse);
                 ConsentResponse = null;
+
+                var url = ctx.Request.Query[this.Options.UserInteractionOptions.ConsentReturnUrlParameter].FirstOrDefault();
+                if (url != null)
+                {
+                    ctx.Response.Redirect(url);
+                }
             }
         }
 
@@ -153,12 +166,8 @@ namespace IdentityServer4.Tests.Common
 
         async Task ReadErrorMessage(HttpContext ctx)
         {
-            try
-            {
-                var interaction = ctx.RequestServices.GetRequiredService<ErrorInteraction>();
-                ErrorMessage = await interaction.GetRequestAsync(ctx.Request.Query["id"].First());
-            }
-            catch { }
+            var interaction = ctx.RequestServices.GetRequiredService<IUserInteractionService>();
+            ErrorMessage = await interaction.GetErrorContextAsync();
         }
 
         /* helpers */
